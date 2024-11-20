@@ -1,0 +1,80 @@
+name: Build LonganPi 3H Image
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. 检出代码
+    - name: Checkout source code
+      uses: actions/checkout@v3
+
+    # 2. 安装依赖
+    - name: Setup build environment
+      run: |
+        sudo apt update
+        sudo apt install -y build-essential gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
+          make git libncurses-dev flex bison bc python3 python3-pip wget cpio unzip rsync
+
+    # 3. 克隆 LonganPi 3H SDK
+    - name: Clone LonganPi 3H SDK
+      run: |
+        git clone https://github.com/sipeed/LonganPi-3H-SDK.git
+
+    # 4. 克隆 Linux 主线源码
+    - name: Clone Linux Kernel
+      run: |
+        git clone https://github.com/torvalds/linux.git
+
+    # 5. 拷贝设备树文件并应用补丁
+    - name: Setup Linux kernel
+      run: |
+        cp LonganPi-3H-SDK/linux/dts/sun50i-h618-longanpi-3h.dts linux/arch/arm64/boot/dts/allwinner/
+        cp LonganPi-3H-SDK/linux/dts/sun50i-h618-longan-module-3h.dtsi linux/arch/arm64/boot/dts/allwinner/
+        cd linux
+        for patch in ../LonganPi-3H-SDK/linux/patches/*.patch; do
+          patch -p1 < "$patch"
+        done
+
+    # 6. 编译 Linux 内核
+    - name: Build Linux kernel
+      run: |
+        cd linux
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) all
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) modules
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) dtbs
+
+    # 7. 编译 U-Boot
+    - name: Build U-Boot
+      run: |
+        cd LonganPi-3H-SDK
+        ./mkatf.sh
+        ./mkuboot.sh
+
+    # 8. 构建文件系统
+    - name: Build rootfs
+      run: |
+        cd LonganPi-3H-SDK
+        ./mkrootfs.sh
+
+    # 9. 构建启动镜像
+    - name: Build bootable image
+      run: |
+        cd LonganPi-3H-SDK
+        ./mkimage.sh
+
+    # 10. 上传构建产物
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: longanpi-3h-image
+        path: LonganPi-3H-SDK/build/images/sdcard.img
