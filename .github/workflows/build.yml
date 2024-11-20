@@ -37,7 +37,7 @@ jobs:
           echo "CONFIG_USB_SUPPORT=y" >> .config
           echo "CONFIG_SUNXI=y" >> .config
           echo "CONFIG_SUNXI_EMMC=y" >> .config
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- menuconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
       # 4. 编译内核和模块
       - name: Build kernel and modules
