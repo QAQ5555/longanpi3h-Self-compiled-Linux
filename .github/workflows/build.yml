@@ -1,75 +1,115 @@
-name: Build LonganPi 3H Image
+name: Build LonganPi 3H Ubuntu Image
 
 on:
   workflow_dispatch:
 
+env:
+  ARCH: arm64
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
-    # 1. 检出代码
-    - name: Checkout source code
-      uses: actions/checkout@v3
+      # 1. 安装构建所需的依赖
+      - name: Install dependencies
+        run: |
+          sudo apt update && \
+          sudo apt install -y gcc-aarch64-linux-gnu qemu-user-static \
+          make build-essential bison flex libncurses-dev libssl-dev bc \
+          cpio rsync kmod u-boot-tools xz-utils debootstrap dosfstools \
+          gdisk e2fsprogs
 
-    # 2. 安装依赖
-    - name: Setup build environment
-      run: |
-        sudo apt update
-        sudo apt install -y build-essential gcc-arm-linux-gnueabi gcc-aarch64-linux-gnu \
-          make git libncurses-dev flex bison bc python3 python3-pip wget cpio unzip rsync
+      # 2. 克隆主线 Linux 源码
+      - name: Clone Linux kernel
+        run: |
+          git clone --depth 1 https://github.com/torvalds/linux.git
 
-    # 3. 克隆 LonganPi 3H SDK
-    - name: Clone LonganPi 3H SDK
-      run: |
-        git clone https://github.com/sipeed/LonganPi-3H-SDK.git
+      # 3. 配置内核
+      - name: Configure kernel
+        run: |
+          cd linux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          echo "CONFIG_BLK_DEV_INITRD=y" >> .config
+          echo "CONFIG_MMC=y" >> .config
+          echo "CONFIG_MMC_BLOCK=y" >> .config
+          echo "CONFIG_EXT4_FS=y" >> .config
+          echo "CONFIG_USB_SUPPORT=y" >> .config
+          echo "CONFIG_SUNXI=y" >> .config
+          echo "CONFIG_SUNXI_EMMC=y" >> .config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- menuconfig
 
-    # 4. 克隆 Linux 主线源码
-    - name: Clone Linux Kernel
-      run: |
-        git clone https://github.com/torvalds/linux.git
+      # 4. 编译内核和模块
+      - name: Build kernel and modules
+        run: |
+          cd linux
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) modules
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) dtbs
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) modules_install INSTALL_MOD_PATH=output
 
-    # 5. 拷贝设备树文件并应用补丁
-    - name: Setup Linux kernel
-      run: |
-        cp LonganPi-3H-SDK/linux/dts/sun50i-h618-longanpi-3h.dts linux/arch/arm64/boot/dts/allwinner/
-        cp LonganPi-3H-SDK/linux/dts/sun50i-h618-longan-module-3h.dtsi linux/arch/arm64/boot/dts/allwinner/
-        cd linux
-        for patch in ../LonganPi-3H-SDK/linux/patches/*.patch; do
-          patch -p1 < "$patch"
-        done
+      # 5. 编译 U-Boot
+      - name: Build U-Boot
+        run: |
+          git clone --depth 1 https://source.denx.de/u-boot/u-boot.git
+          cd u-boot
+          make ARCH=arm CROSS_COMPILE=aarch64-linux-gnu- sunxi_defconfig
+          make ARCH=arm CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
 
-    # 6. 编译 Linux 内核
-    - name: Build Linux kernel
-      run: |
-        cd linux
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) all
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) modules
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) dtbs
+      # 6. 创建 Ubuntu 根文件系统
+      - name: Create Ubuntu rootfs
+        run: |
+          mkdir -p rootfs
+          sudo debootstrap --arch=arm64 --foreign jammy rootfs http://ports.ubuntu.com/
+          sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+          sudo chroot rootfs /debootstrap/debootstrap --second-stage
+          sudo chroot rootfs apt update
+          sudo chroot rootfs apt install -y ssh sudo net-tools ifupdown
 
-    # 7. 编译 U-Boot
-    - name: Build U-Boot
-      run: |
-        cd LonganPi-3H-SDK
-        ./mkatf.sh
-        ./mkuboot.sh
+      # 7. 安装内核模块到根文件系统
+      - name: Install kernel modules
+        run: |
+          sudo cp -r linux/output/lib rootfs/lib
 
-    # 8. 构建文件系统
-    - name: Build rootfs
-      run: |
-        cd LonganPi-3H-SDK
-        ./mkrootfs.sh
+      # 8. 配置根文件系统
+      - name: Configure rootfs
+        run: |
+          echo "root:root" | sudo chroot rootfs chpasswd
+          echo "ubuntu" | sudo tee rootfs/etc/hostname
+          echo "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp" | sudo tee rootfs/etc/network/interfaces
+          sudo mkdir -p rootfs/boot/dtbs
+          sudo cp linux/arch/arm64/boot/dts/allwinner/*.dtb rootfs/boot/dtbs/
+          sudo cp linux/arch/arm64/boot/Image rootfs/boot/
 
-    # 9. 构建启动镜像
-    - name: Build bootable image
-      run: |
-        cd LonganPi-3H-SDK
-        ./mkimage.sh
+      # 9. 构建启动镜像
+      - name: Create bootable image
+        run: |
+          dd if=/dev/zero of=sdcard.img bs=1M count=4096
+          parted -s sdcard.img mklabel gpt
+          parted -s sdcard.img mkpart primary fat32 1MiB 128MiB
+          parted -s sdcard.img mkpart primary ext4 128MiB 100%
+          sudo losetup -Pf sdcard.img
+          sudo mkfs.vfat /dev/loop0p1
+          sudo mkfs.ext4 /dev/loop0p2
+          mkdir -p boot root
+          sudo mount /dev/loop0p1 boot
+          sudo mount /dev/loop0p2 root
+          sudo cp -r rootfs/* root/
+          sudo umount boot root
+          sudo losetup -d /dev/loop0
 
-    # 10. 上传构建产物
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v3
-      with:
-        name: longanpi-3h-image
-        path: LonganPi-3H-SDK/build/images/sdcard.img
+      # 10. 压缩和校验
+      - name: Compress and checksum
+        run: |
+          xz -z -v -9 -T$(nproc) sdcard.img
+          sha512sum sdcard.img.xz > sdcard.img.xz.sha512
+
+      # 11. 上传构建产物
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          retention-days: 30
+          name: ubuntu-longanpi3h-image
+          path: |
+            sdcard.img.xz
+            sdcard.img.xz.sha512
