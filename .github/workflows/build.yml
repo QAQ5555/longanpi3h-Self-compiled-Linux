@@ -1,4 +1,4 @@
-name: Build LonganPi 3H Ubuntu Image
+name: Build LonganPi 3H Full Feature Image
 
 on:
   workflow_dispatch:
@@ -11,35 +11,71 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      # 1. 安装构建所需的依赖
+      # 1. 安装构建依赖
       - name: Install dependencies
         run: |
           sudo apt update && \
           sudo apt install -y gcc-aarch64-linux-gnu qemu-user-static \
           make build-essential bison flex libncurses-dev libssl-dev bc \
-          cpio rsync kmod u-boot-tools xz-utils debootstrap dosfstools \
-          gdisk e2fsprogs
+          cpio rsync kmod u-boot-tools xz-utils f2fs-tools dosfstools \
+          gdisk e2fsprogs debootstrap mesa-utils mesa-vulkan-drivers
 
       # 2. 克隆主线 Linux 源码
       - name: Clone Linux kernel
         run: |
           git clone --depth 1 https://github.com/torvalds/linux.git
 
-      # 3. 配置内核
+      # 3. 配置内核，添加所需特性支持
       - name: Configure kernel
         run: |
           cd linux
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-          echo "CONFIG_BLK_DEV_INITRD=y" >> .config
+          # 启用 Allwinner H618 支持
+          echo "CONFIG_ARCH_SUNXI=y" >> .config
+          echo "CONFIG_MACH_SUN50I=y" >> .config
+          echo "CONFIG_ARM64=y" >> .config
+          # 启用 GPU Mali-G31 支持
+          echo "CONFIG_DRM=y" >> .config
+          echo "CONFIG_DRM_MALI_DISPLAY=y" >> .config
+          echo "CONFIG_DRM_PANFROST=y" >> .config
+          echo "CONFIG_MALI_GRALLOC=y" >> .config
+          # 视频解码/编码
+          echo "CONFIG_VIDEO_SUNXI_CEDAR=y" >> .config
+          echo "CONFIG_MEDIA_SUPPORT=y" >> .config
+          echo "CONFIG_V4L2_MEM2MEM_DEVICES=y" >> .config
+          echo "CONFIG_VIDEO_H264=y" >> .config
+          echo "CONFIG_VIDEO_H265=y" >> .config
+          # RAM、存储、TF 卡、eMMC
           echo "CONFIG_MMC=y" >> .config
           echo "CONFIG_MMC_BLOCK=y" >> .config
+          echo "CONFIG_MTD=y" >> .config
+          # 以太网
+          echo "CONFIG_ETHERNET=y" >> .config
+          echo "CONFIG_NET_VENDOR_ALLWINNER=y" >> .config
+          echo "CONFIG_DWMAC_SUN8I=y" >> .config
+          # USB 支持
+          echo "CONFIG_USB=y" >> .config
+          echo "CONFIG_USB_XHCI_HCD=y" >> .config
+          echo "CONFIG_USB_XHCI_PLATFORM=y" >> .config
+          echo "CONFIG_USB_GADGET=y" >> .config
+          echo "CONFIG_TYPEC=y" >> .config
+          # GPIO 支持
+          echo "CONFIG_GPIO_SYSFS=y" >> .config
+          echo "CONFIG_SPI=y" >> .config
+          echo "CONFIG_I2C=y" >> .config
+          echo "CONFIG_SERIAL_DEV_BUS=y" >> .config
+          # 常见模块支持
+          echo "CONFIG_SND=y" >> .config
+          echo "CONFIG_SND_SOC=y" >> .config
+          echo "CONFIG_CRYPTO=y" >> .config
+          echo "CONFIG_INPUT=y" >> .config
+          echo "CONFIG_BLK_DEV_INITRD=y" >> .config
           echo "CONFIG_EXT4_FS=y" >> .config
-          echo "CONFIG_USB_SUPPORT=y" >> .config
-          echo "CONFIG_SUNXI=y" >> .config
-          echo "CONFIG_SUNXI_EMMC=y" >> .config
+          echo "CONFIG_F2FS_FS=y" >> .config
+          echo "CONFIG_F2FS_FS_COMPRESSION=y" >> .config
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-      # 4. 编译内核和模块
+      # 4. 编译内核及模块
       - name: Build kernel and modules
         run: |
           cd linux
@@ -56,15 +92,19 @@ jobs:
           make ARCH=arm CROSS_COMPILE=aarch64-linux-gnu- sunxi_defconfig
           make ARCH=arm CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
 
-      # 6. 创建 Ubuntu 根文件系统
+      # 6. 创建基于 Ubuntu 的根文件系统并配置
       - name: Create Ubuntu rootfs
         run: |
           mkdir -p rootfs
-          sudo debootstrap --arch=arm64 --foreign jammy rootfs http://ports.ubuntu.com/
+          sudo debootstrap --arch=arm64 --variant=minbase jammy rootfs http://ports.ubuntu.com/
           sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
           sudo chroot rootfs /debootstrap/debootstrap --second-stage
           sudo chroot rootfs apt update
-          sudo chroot rootfs apt install -y ssh sudo net-tools ifupdown
+          sudo chroot rootfs apt install -y ssh sudo net-tools ifupdown mesa-utils mesa-vulkan-drivers
+          echo "root:root" | sudo chroot rootfs chpasswd
+          echo "longanpi" | sudo tee rootfs/etc/hostname
+          echo "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp" | sudo tee rootfs/etc/network/interfaces
+          sudo chroot rootfs systemctl enable ssh
 
       # 7. 安装内核模块到根文件系统
       - name: Install kernel modules
@@ -74,23 +114,20 @@ jobs:
       # 8. 配置根文件系统
       - name: Configure rootfs
         run: |
-          echo "root:root" | sudo chroot rootfs chpasswd
-          echo "ubuntu" | sudo tee rootfs/etc/hostname
-          echo "auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp" | sudo tee rootfs/etc/network/interfaces
           sudo mkdir -p rootfs/boot/dtbs
-          sudo cp linux/arch/arm64/boot/dts/allwinner/*.dtb rootfs/boot/dtbs/
+          sudo cp linux/arch/arm64/boot/dts/allwinner/sun50i-h618-longan*.dtb rootfs/boot/dtbs/
           sudo cp linux/arch/arm64/boot/Image rootfs/boot/
 
-      # 9. 构建启动镜像
-      - name: Create bootable image
+      # 9. 创建支持 F2FS 的启动镜像
+      - name: Create F2FS bootable image
         run: |
           dd if=/dev/zero of=sdcard.img bs=1M count=4096
           parted -s sdcard.img mklabel gpt
           parted -s sdcard.img mkpart primary fat32 1MiB 128MiB
-          parted -s sdcard.img mkpart primary ext4 128MiB 100%
+          parted -s sdcard.img mkpart primary f2fs 128MiB 100%
           sudo losetup -Pf sdcard.img
           sudo mkfs.vfat /dev/loop0p1
-          sudo mkfs.ext4 /dev/loop0p2
+          sudo mkfs.f2fs -f -o 1 -O compression -O extra_attr -O project_quota /dev/loop0p2
           mkdir -p boot root
           sudo mount /dev/loop0p1 boot
           sudo mount /dev/loop0p2 root
@@ -98,18 +135,18 @@ jobs:
           sudo umount boot root
           sudo losetup -d /dev/loop0
 
-      # 10. 压缩和校验
+      # 10. 压缩镜像并生成校验文件
       - name: Compress and checksum
         run: |
           xz -z -v -9 -T$(nproc) sdcard.img
           sha512sum sdcard.img.xz > sdcard.img.xz.sha512
 
-      # 11. 上传构建产物
+      # 11. 上传最终镜像
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
           retention-days: 30
-          name: ubuntu-longanpi3h-image
+          name: longanpi3h-feature-image
           path: |
             sdcard.img.xz
             sdcard.img.xz.sha512
